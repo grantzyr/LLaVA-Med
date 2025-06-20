@@ -2,6 +2,8 @@
 
 *Visual instruction tuning towards building large language and vision models with GPT-4 level capabilities in the biomedicine space.*
 
+## Update by grantzyr: adapt OpenAI request
+
 [[Paper, NeurIPS 2023 Datasets and Benchmarks Track (Spotlight)](https://arxiv.org/abs/2306.00890)] 
 
 **LLaVA-Med: Training a Large Language-and-Vision Assistant for Biomedicine in One Day** <br>
