@@ -11,9 +11,11 @@ import logging
 import time
 from typing import List, Union
 import threading
+import uuid
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 import numpy as np
 import requests
 import uvicorn
@@ -21,9 +23,45 @@ import uvicorn
 from llava.constants import CONTROLLER_HEART_BEAT_EXPIRATION
 from llava.utils import build_logger, server_error_msg
 
-
 logger = build_logger("controller", "controller.log")
 
+# OpenAI API compatible models (reuse from worker)
+class ChatMessage(BaseModel):
+    role: str
+    content: Union[str, List[dict]]
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    temperature: float = 1.0
+    top_p: float = 1.0
+    max_tokens: int = 256
+    stream: bool = False
+    stop: Union[str, List[str], None] = None
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    finish_reason: str
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatCompletionChoice]
+
+class ChatCompletionStreamChoice(BaseModel):
+    index: int
+    delta: dict
+    finish_reason: str = None
+
+class ChatCompletionStreamResponse(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionStreamChoice]
 
 class DispatchMethod(Enum):
     LOTTERY = auto()
@@ -214,7 +252,67 @@ class Controller:
             }
             yield json.dumps(ret).encode() + b"\0"
 
+    def openai_chat_completions(self, request: ChatCompletionRequest):
+        """Forward OpenAI chat completions to worker"""
+        if not request.model:
+            worker_addr = self.get_worker_address("llava-med-v1.5-mistral-7b")
+        else:
+            worker_addr = self.get_worker_address(request.model)
+        if not worker_addr:
+            logger.info(f"no worker for model: {request.model}")
+            # Return error response
+            return ChatCompletionResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex}",
+                created=int(time.time()),
+                model=request.model,
+                choices=[ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="No available worker for this model."),
+                    finish_reason="error"
+                )]
+            )
 
+        try:
+            # Forward request to worker
+            response = requests.post(
+                worker_addr + "/v1/chat/completions",
+                # json=request.model_dump(),
+                json=request.dict(),
+                stream=request.stream,
+                timeout=60 if not request.stream else None
+            )
+            # Forward non-streaming response
+            logger.info(f"response: {response}")
+            logger.info(f"response json: {response.json()}")
+            if response.status_code == 200:
+                return ChatCompletionResponse(**response.json())
+            else:
+                # Error handling for non-streaming
+                logger.error(f"Worker error: {response.status_code}, {response.text}")
+                return ChatCompletionResponse(
+                    id=f"chatcmpl-{uuid.uuid4().hex}",
+                    created=int(time.time()),
+                    model=request.model,
+                    choices=[ChatCompletionChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content="Worker processing error."),
+                        finish_reason="error"
+                    )]
+                )
+                    
+        except requests.exceptions.RequestException as e:
+            logger.info(f"worker timeout: {worker_addr}, error: {e}")
+            return ChatCompletionResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex}",
+                created=int(time.time()),
+                model=request.model,
+                choices=[ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="Worker connection error."),
+                    finish_reason="error"
+                )]
+            )
+            
     # Let the controller act as a worker to achieve hierarchical
     # management. This can be used to connect isolated sub networks.
     def worker_api_get_status(self):
@@ -279,11 +377,27 @@ async def worker_api_generate_stream(request: Request):
     generator = controller.worker_api_generate_stream(params)
     return StreamingResponse(generator)
 
+def call_chat_completion_sync(request: ChatCompletionRequest) -> ChatCompletionResponse:
+    return controller.openai_chat_completions(request)
+    
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """OpenAI compatible chat completions endpoint with load balancing"""
+    logger.info(f"Received chat completion request for model: {request.model}, stream: {request.stream}")
+    
+    # Non-streaming response
+    # response = controller.openai_chat_completions(request)
+    # logger.info(f"final response: {response}")
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(None, call_chat_completion_sync, request)
+    logger.info(f"final response: {response}")
 
+    return response
+        
 @app.post("/worker_get_status")
 async def worker_api_get_status(request: Request):
     return controller.worker_api_get_status()
-
+        
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
